@@ -1,16 +1,18 @@
-setwd("~/Documents/gitRepos/HousePrices")
+setwd("D:/1_Kaggle/repos/Kaggle_HousePrices")
 library(ggplot2)
 #install.packages("tidymodels")
 
 # might want to use tidymodels library for recipe and baking ETL
 # cv.glmnet applies cv to get optimal lambda only - try glmnetUtils library (cva.glmnet)
+# might want to optimise xgBoost parameters based on linear regression predictions - this could help with setting right parameters against overfitting
 # difference between ensembling and stacking?
 # lime package includes SHAP?
 # apply training on training set only!
 # randomForestExplainer
 # random search instead of grid search
 
-library(cva.glmnet)
+
+# library(cva.glmnet)
 
 
 trainData <- read.csv("train.csv"
@@ -217,6 +219,70 @@ x   <- as.matrix(xDf)
 yDf <- myData[!is.na(myData$target), c("target")]
 y   <- as.matrix(yDf)
 
+
+
+
+# linear regression -----------------------------
+
+#install.packages("glmnet")
+require(glmnet)
+
+glmLmabda <- glmnet::cv.glmnet(x = x
+                               , y = y
+                               , type.measure="mse"
+                               , nfolds = 10)
+
+lambda <- c(0
+            , glmLmabda$lambda.min
+            , glmLmabda$lambda.1se)
+
+
+myGlm <- glmnet(x = x
+                , y = y
+                , alpha = 1
+                , family="gaussian"
+                , lambda = lambda)
+
+tableOfCoef <- coef(myGlm,s=c(0, glmLmabda$lambda.min, glmLmabda$lambda.1se))
+# colnames(tableOfCoef)
+# names(tableOfCoef[,3])
+
+#install.packages("glmnetUtils")
+require(glmnetUtils)
+
+glmLmabdaA <- cva.glmnet(x = x
+                         , y = y
+                         , alpha = seq(0, 1, len = 11)^3
+                         , nfolds = 7)
+
+plot(glmLmabdaA)
+
+numAlphas <- length(glmLmabdaA$alpha)
+glmLmabdaAsummary <- c()
+
+for (i in 1:numAlphas){
+  glmnet.model <- glmLmabdaA$modlist[[i]]
+  min.mse <-  min(glmnet.model$cvm)
+  min.lambda <- glmnet.model$lambda.min
+  alpha.value <- glmLmabdaA$alpha[i]
+  glmLmabdaAsummary <- rbind(glmLmabdaAsummary
+                             , c(alpha.value, min.lambda, min.mse))
+}
+
+plot(glmLmabdaAsummary[,3])
+bestAlpha  <- glmLmabdaAsummary[which.min(glmLmabdaAsummary[,3]), 1]
+bestLambda <- glmLmabdaAsummary[which.min(glmLmabdaAsummary[,3]), 2]
+
+myGlmA <- glmnet(x = x
+                 , y = y
+                 , alpha = bestAlpha
+                 , lambda = bestLambda
+                 , family="gaussian")
+
+myGlmACoef <- as.matrix(coef(myGlmA))
+sum(myGlmACoef>0)
+
+
 # xg-boost --------------------------------------
 
 #install.packages("xgboost")
@@ -325,66 +391,6 @@ xgb <- xgb.train(params = params
                 , nrounds = 500
                 , prediction = T
                 , metrics = "rmse")
-
-
-# linear regression -----------------------------
-
-#install.packages("glmnet")
-require(glmnet)
-
-glmLmabda <- glmnet::cv.glmnet(x = x
-                       , y = y
-                       , type.measure="mse"
-                       , nfolds = 10)
-
-lambda <- c(0
-            , glmLmabda$lambda.min
-            , glmLmabda$lambda.1se)
-
-
-myGlm <- glmnet(x = x
-              , y = y
-              , alpha = 1
-              , family="gaussian"
-              , lambda = lambda)
-
-coef(myGlm,s=c(0, glmLmabda$lambda.min, glmLmabda$lambda.1se))
-
-
-
-#install.packages("glmnetUtils")
-require (glmnetUtils)
-
-glmLmabdaA <- cva.glmnet(x = x
-                        , y = y
-                        , alpha = seq(0, 1, len = 11)^3
-                        , nfolds = 7)
-
-plot(glmLmabdaA)
-
-numAlphas <- length(glmLmabdaA$alpha)
-glmLmabdaAsummary <- c()
-
-for (i in 1:numAlphas){
-  glmnet.model <- glmLmabdaA$modlist[[i]]
-  min.mse <-  min(glmnet.model$cvm)
-  min.lambda <- glmnet.model$lambda.min
-  alpha.value <- glmLmabdaA$alpha[i]
-  glmLmabdaAsummary <- rbind(glmLmabdaAsummary
-                             , c(alpha.value, min.lambda, min.mse))
-}
-
-plot(glmLmabdaAsummary[,3])
-bestAlpha  <- glmLmabdaAsummary[which.min(glmLmabdaAsummary[,3]), 1]
-bestLambda <- glmLmabdaAsummary[which.min(glmLmabdaAsummary[,3]), 2]
-
-myGlmA <- glmnet(x = x
-                 , y = y
-                 , alpha = bestAlpha
-                 , lambda = bestLambda
-                 , family="gaussian")
-
-coef(myGlmA)
 
 
 
