@@ -1,7 +1,16 @@
 setwd("~/Documents/gitRepos/HousePrices")
 library(ggplot2)
+#install.packages("tidymodels")
 
+# might want to use tidymodels library for recipe and baking ETL
+# cv.glmnet applies cv to get optimal lambda only - try glmnetUtils library (cva.glmnet)
+# difference between ensembling and stacking?
+# lime package includes SHAP?
+# apply training on training set only!
+# randomForestExplainer
+# random search instead of grid search
 
+library(cva.glmnet)
 
 
 trainData <- read.csv("train.csv"
@@ -84,7 +93,8 @@ classFromNumeric <- rbind(c("OverallCond",     5)
                           , c("ScreenPorch",   0)
                           )
 
-table(myData$OverallCond)
+# table(myData$OverallCond)
+# plot(myData[,c("OverallCond", "target")])
 
 for (i in 1:nrow(classFromNumeric)){
   colName <- colnames(myData)[grep(classFromNumeric[i,1], colnames(myData))]
@@ -101,84 +111,218 @@ for (i in 1:nrow(classFromNumeric)){
   myData[, colName] <- c()
 }
 
+# plot(myData[,c("OverallCond_", "target")])
+
 # table(myData$OverallCond_)
 # table(myData$OverallCond_is5)
 # str(myData)
 # dim(myData)
 
+# testing methodology for linear + certain different value ----------------------------------------
+
+#       plot(myData$OverallCond_, myData$target)
+#       
+#       myTibble <- myData %>%
+#         group_by(OverallCond_is5) %>%
+#         summarise(avgSalePrice = mean(target, na.rm = T))
+#       
+#       
+#       tryFit <- glm(formula = target ~ OverallCond_ + OverallCond_is5
+#                     , family = gaussian
+#                     , data = myData[!is.na(myData$target),])
+#       summary(tryFit)
+#       
+#       tryFitPlot <- c()
+#       for (i in 1:10){
+#         tryFitPlot <- c(tryFitPlot
+#                         , tryFit$coefficients[1] + i*tryFit$coefficients[2] + (i==5)*tryFit$coefficients[3])
+#       }
+#       plot(tryFitPlot)
+
+# -------------------------------------------------------------------------------------------------
 
 # one-hot-encode character features
 
 toOneHoteEncode <- colnames(myData)[lapply(myData, class) == "character"]
 
-mapTable <- table(myData[!is.na(myData$target), "HouseStyle"])
-mapTable <- mapTable[order(mapTable)]
-mapToOther <- names(mapTable)[mapTable < 10]
-
+str(myData)
 
 for (i in toOneHoteEncode){
+  mapTable <- table(myData[!is.na(myData$target), i])
+  mapTable <- mapTable[order(mapTable)]
   
+  mapToOther <- names(mapTable)[mapTable < 5]
+  myData[myData[, i] %in% mapToOther, i] <- "other"
+  
+  myData[is.na(myData[, i]), i] <- "other"
+  
+  noMapMax <- names(mapTable)[mapTable == max(mapTable)]
+  mapFeatures <- if (length(mapToOther) + sum(is.na(myData[, i])) > 0){
+    c("other", names(mapTable)[!(names(mapTable) %in% c(mapToOther, noMapMax))])
+  } else {
+    names(mapTable)[!(names(mapTable) %in% c(mapToOther, noMapMax))]
+  }
+  
+  for (j in mapFeatures){
+    myData$newOneHot <- myData[, i] == j
+    colnames(myData)[colnames(myData) == "newOneHot"] <- paste0(i
+                                                                , "_"
+                                                                , j)
+  }
+  myData[, i] <- c()
 }
 
 
+# str(myData)
+# dim(myData)
+# summary(myData)
+
+# standardise numerical features
+
+toStandardise <- colnames(myData)[lapply(myData, class) %in% c("numeric", "integer") &
+                                    colnames(myData) != "target"]
+
+for (i in toStandardise){
+  myMean <- mean(myData[, i], na.rm = T)
+  mySd <- sd(myData[, i], na.rm = T)
+  myData[, i] <- (myData[, i]-myMean)/mySd
+  myData[is.na(myData[, i]), i] <- 0
+}
 
 
-colnames(myData)[lapply(myData, class) == "numeric"]
+# standardise numerical features
 
-colnames(myData)[lapply(myData, class) == "logical"]
+toInteger <- colnames(myData)[lapply(myData, class) == "logical"]
 
+for (i in toInteger){
+  myData[, i] <- as.integer(myData[, i])
+  myData[is.na(myData[, i]), i] <- 0
+}
 
-plot(trainData$OverallQual, trainData$target)
-plot(log(trainData$OverallQual), trainData$target)
-
-table(trainData$OverallCond)
-
-plot(trainData$target, trainData$OverallCond)
-
-hist(myDummyData$target, breaks = 50)
-summary(myDummyData)
-head(myDummyData)
-
-
+str(myData)
+# summary(myData$target)
+# dim(myData)
+# summary(myData[, 1:121])
+# summary(myData[, 122:242])
 
 #p <- ggplot(trainData, aes(x=as.character(YearBuilt), y=log(SalePrice), color=YearBuilt)) + geom_boxplot()
 #p
 
-yDummyData$mean <- mean(myDummyData$target)
-max_rmse <- sqrt(mean((myDummyData$target - myDummyData$mean)^2))
+myDataMean <- mean(myData$target, na.rm = T)
+max_rmse <- sqrt(mean((myData$target - myDataMean)^2, na.rm = T))
 
-featureCols <- grep("var", colnames(myDummyData))
-xDf <- myDummyData[,featureCols]
+featureCols <- colnames(myData)[colnames(myData) != "target"]
+xDf <- myData[!is.na(myData$target), featureCols]
 x   <- as.matrix(xDf)
-yDf <- myDummyData[,c("target")]
+yDf <- myData[!is.na(myData$target), c("target")]
 y   <- as.matrix(yDf)
 
 # xg-boost --------------------------------------
 
 #install.packages("xgboost")
-library (xgboost)
+library(xgboost)
+library(dplyr)
 
-myDummyDataM <- xgb.DMatrix(data = as.matrix(myDummyData[,featureCols])
-                            , label = as.matrix(myDummyData[,c("target")]))
+dim(myData)
+set.seed(19301)
+myDataSxgb <- myData[!is.na(myData$target),]
+myDataSxgb$cvSplit <- round(runif(nrow(myDataSxgb), 0.5, 7.5))
+
+rmse_xgb <- c()
+for (k in seq(from = 1, to = 7, by = 1)){
+  
+  myDataMxgb <- xgb.DMatrix(data = as.matrix(myDataSxgb[myDataSxgb$cvSplit != k
+                                                        , !(colnames(myDataSxgb) %in% c("target"
+                                                                                    , "cvSplit"))])
+                            , label = as.matrix(myDataSxgb[myDataSxgb$cvSplit != k
+                                                           , c("target")]))
+  
+  myDataMxgbT <- as.matrix(myDataSxgb[myDataSxgb$cvSplit == k
+                                      , !(colnames(myDataSxgb) %in% c("target"
+                                                                      , "cvSplit"))])
+  
+  
+  
+  for (subsample in 0.65){
+    for (colsample_bytree in 0.65){
+      for (max_depth in 6){
+        for (nrounds in seq(from = 400, to = 700, by = 100)){
+          for (eta in seq(from = 0.01, to = 0.05, by = 0.01)){
+            params <- list(booster = "gbtree"
+                          , objective = "reg:squarederror"
+                          , eta = eta
+                          , gamma = 0
+                          , max_depth = max_depth
+                          , min_child_weight = 1
+                          , subsample = subsample
+                          , colsample_bytree = colsample_bytree
+                          )
+          
+            xgbT <- xgb.train(params = params
+                              , data = myDataMxgb
+                              , nrounds = nrounds
+                             , prediction = T
+                             , metrics = "rmse")
+           
+           xgbPredT <- predict(xgbT, newdata = myDataMxgbT)
+           
+           #xgbPred   <- predict(xgb,   newdata = newx)
+           
+           rmse <- sqrt(mean((myDataSxgb$target[myDataSxgb$cvSplit == k] -
+                                xgbPredT)^2))
+            
+           rmse_xgb <- rbind(rmse_xgb
+                             , c(subsample
+                                 , colsample_bytree
+                                  , max_depth
+                                  , nrounds
+                                  , eta
+                                  , rmse))
+            
+            print(c(k
+                    , subsample
+                    , colsample_bytree
+                    , max_depth
+                    , nrounds
+                    , eta
+                    , rmse))
+          }
+        }
+      }
+    }
+  }
+}
+rmse_xgb <- as.data.frame(rmse_xgb)
+colnames(rmse_xgb) <- c("subsample", "colsample_bytree", "max_depth", "nrounds", "eta", "rmse")
+rmse_xgbS <- rmse_xgb %>%
+  group_by(subsample, colsample_bytree, max_depth, nrounds, eta) %>%
+  summarise(avgRMSE = mean(rmse))
+#rmse_xgbS
+plot(rmse_xgbS$avgRMSE)
+head(rmse_xgbS[order(rmse_xgbS$avgRMSE),], 10)
+
+xgb_p <- ggplot(rmse_xgb, aes(x=params, y=rmse)) + geom_boxplot()
+xgb_p
+
+
+
+myDataM <- xgb.DMatrix(data = as.matrix(myData[!is.na(myData$target)
+                                               , featureCols])
+                          , label = as.matrix(myData$target[!is.na(myData$target)]))
 
 params <- list(booster = "gbtree"
-               , objective = "reg:linear"
-               , eta=0.3
-               , gamma=0
-               , max_depth=6
-               , min_child_weight=1
-               , subsample=1
-               , colsample_bytree=1)
+               , objective = "reg:squarederror"
+               , eta = 0.04
+               , gamma = 0
+               , max_depth = 6
+               , min_child_weight = 1
+               , subsample = 0.65
+               , colsample_bytree = 0.65
+               )
 
 xgb <- xgb.train(params = params
-                , data = myDummyDataM
-                , nrounds = 150
-                , nfold = 10
-                , showsd = T
-                , stratified = T
-                , print_every_n = 10
-                , early_stop_round = 20
-                , maximize = F
+                , data = myDataM
+                , nrounds = 500
                 , prediction = T
                 , metrics = "rmse")
 
@@ -188,12 +332,15 @@ xgb <- xgb.train(params = params
 #install.packages("glmnet")
 require(glmnet)
 
-glmLmabda <- cv.glmnet(x = x
+glmLmabda <- glmnet::cv.glmnet(x = x
                        , y = y
                        , type.measure="mse"
                        , nfolds = 10)
 
-lambda <- c(0, seq(from = glmLmabda$lambda.min, to = glmLmabda$lambda.1se, by = 0.01))
+lambda <- c(0
+            , glmLmabda$lambda.min
+            , glmLmabda$lambda.1se)
+
 
 myGlm <- glmnet(x = x
               , y = y
@@ -202,6 +349,43 @@ myGlm <- glmnet(x = x
               , lambda = lambda)
 
 coef(myGlm,s=c(0, glmLmabda$lambda.min, glmLmabda$lambda.1se))
+
+
+
+#install.packages("glmnetUtils")
+require (glmnetUtils)
+
+glmLmabdaA <- cva.glmnet(x = x
+                        , y = y
+                        , alpha = seq(0, 1, len = 11)^3
+                        , nfolds = 7)
+
+plot(glmLmabdaA)
+
+numAlphas <- length(glmLmabdaA$alpha)
+glmLmabdaAsummary <- c()
+
+for (i in 1:numAlphas){
+  glmnet.model <- glmLmabdaA$modlist[[i]]
+  min.mse <-  min(glmnet.model$cvm)
+  min.lambda <- glmnet.model$lambda.min
+  alpha.value <- glmLmabdaA$alpha[i]
+  glmLmabdaAsummary <- rbind(glmLmabdaAsummary
+                             , c(alpha.value, min.lambda, min.mse))
+}
+
+plot(glmLmabdaAsummary[,3])
+bestAlpha  <- glmLmabdaAsummary[which.min(glmLmabdaAsummary[,3]), 1]
+bestLambda <- glmLmabdaAsummary[which.min(glmLmabdaAsummary[,3]), 2]
+
+myGlmA <- glmnet(x = x
+                 , y = y
+                 , alpha = bestAlpha
+                 , lambda = bestLambda
+                 , family="gaussian")
+
+coef(myGlmA)
+
 
 
 # randomForest ----------------------------------
@@ -215,16 +399,16 @@ library(dplyr)
 
 set.seed(200597)
 
-# myDummyDataS <- dplyr::sample_n(myDummyData, nrow(myDummyData)/4)
-# myDummyDataS$cvSplit <- round(runif(nrow(myDummyDataS), 0.5, 5.5))
+# myDataS <- dplyr::sample_n(myData[!is.na(myData$target), ], 250)
+# myDataS$cvSplit <- round(runif(nrow(myDataS), 0.5, 5.5))
 # randFSummary <- c()
 # for (i in 1:5){
-#   xLoop <- myDummyDataS[myDummyDataS$cvSplit != i, featureCols]
-#   yLoop <- myDummyDataS[myDummyDataS$cvSplit != i, c("target")]
-#   xLoopTest <- myDummyDataS[myDummyDataS$cvSplit == i, featureCols]
-#   aLoopTest <- myDummyDataS[myDummyDataS$cvSplit == i, c("target")]
+#   xLoop <- myDataS[myDataS$cvSplit != i, featureCols]
+#   yLoop <- myDataS[myDataS$cvSplit != i, c("target")]
+#   xLoopTest <- myDataS[myDataS$cvSplit == i, featureCols]
+#   aLoopTest <- myDataS[myDataS$cvSplit == i, c("target")]
 #   print(i)
-#   for (j in 1:length(featureCols)){
+#   for (j in round(length(featureCols)/10, 0):round(length(featureCols)/2, 0)){
 #     randF <- randomForest(x = xLoop
 #                           , y = yLoop
 #                           , mtry = j)
@@ -245,14 +429,16 @@ set.seed(200597)
 
 randF <- randomForest(x = xDf
                       , y = yDf
-                      , ntree = 500
+                      #, ntree = 500
                       #, sampsize = 60
-                      , mtry = 5)
+                      , maxnodes = 200
+                      , mtry = 60
+                      )
 
 #install.packages("rpart")
 library(rpart)
-dTree <- rpart(target ~ var1 + var2 + var3 + var4 + var5 + var6 + var7
-                     , data = myDummyData
+dTree <- rpart(target ~ .
+                     , data = myData
                      , method = "anova"
                      , control = rpart.control(cp = 0.001)
                      )
@@ -271,70 +457,68 @@ library(keras)
 set.seed(200601)
 model <- keras_model_sequential() 
 model %>% 
-  layer_dense(units = 256, activation = "relu", input_shape = length(featureCols)) %>% 
+  layer_dense(units = 2000, activation = "relu", input_shape = length(featureCols)) %>% 
   layer_dropout(rate = 0.4) %>% 
-  layer_dense(units = 128, activation = "relu") %>%
+  layer_dense(units = 500, activation = "relu") %>%
   layer_dropout(rate = 0.3) %>%
   layer_dense(units = 1, activation = "linear")#"softmax")
 
 model %>% compile(
-  loss = "mean_squared_error",
+  loss = "mse",
   optimizer = optimizer_adam(),
   metrics = c("mse")
 )
 
 history <- model %>% keras::fit(
   x, y, 
-  epochs = 30, batch_size = 128, 
+  epochs = 20, batch_size = 128, 
   validation_split = 0.2
 )
 
 
 # EVALUATION ----------------------------------------------
 
-set.seed(200593)
-myTestData <- data.frame(var1 = rnorm(10000, 0, 4)
-                          , var2 = rpois(10000, 3)
-                          , var3 = rbinom(10000, 1, 0.2)
-                          , var4 = runif(10000, 3, 7)
-                          , var5 = rbinom(10000, 1, 0.1))
-myTestData$var6 <- log(myTestData$var2+10)^5/100
-myTestData$var7 <- runif(10000, min = 25, max = 35)*myTestData$var5
-myTestData$actual <- with(myTestData
-                          , sqrt(var1^2 + 3*var2)*(1+var3) + var4*(var6-2)/2 + var7) + rnorm(10000, 0, 1.5)
-
 rmse <- function(predictionColName){
-  rmse <- sqrt(mean((myTestData$actual - myTestData[,c(predictionColName)])^2))
+  rmse <- sqrt(mean((myData$target[!is.na(myData$target)] -
+                       myData[!is.na(myData$target), c(predictionColName)])^2))
   rmse
 }
 
-newx <- as.matrix(myTestData[,featureCols])
+newx <- as.matrix(myData[, featureCols])
 
-myTestData$xgbPred   <- predict(xgb,   newdata = newx)
-myTestData$glm0Pred  <- predict(myGlm, newx = newx, s=0)
-myTestData$glm1Pred  <- predict(myGlm, newx = newx, s=glmLmabda$lambda.min)
-myTestData$glm2Pred  <- predict(myGlm, newx = newx, s=mean(lambda))
-myTestData$glm3Pred  <- predict(myGlm, newx = newx, s=max(lambda))
-myTestData$randFPred <- predict(randF, newdata = newx)
-myTestData$dTreePred <- predict(dTree, newdata = myTestData[,featureCols])
-myTestData$nnPred    <- model %>% predict(newx)
+myData$xgbPred   <- predict(xgb,   newdata = newx)
+myData$glm0Pred  <- predict(myGlm, newx = newx, s=0)
+myData$glm1Pred  <- predict(myGlm, newx = newx, s=glmLmabda$lambda.min)
+myData$glm2Pred  <- predict(myGlm, newx = newx, s=mean(glmLmabda$lambda.min, glmLmabda$lambda.1se)) #was mean(lambda)
+myData$glm3Pred  <- predict(myGlm, newx = newx, s=glmLmabda$lambda.1se)
+myData$glm4Pred  <- predict(myGlmA, newx = newx)
+myData$randFPred <- predict(randF, newdata = newx)
+myData$dTreePred <- predict(dTree, newdata = myData[,featureCols])
+myData$nnPred    <- model %>% predict(newx)
 
 
-head(myTestData)
-
-myModels <- colnames(myTestData)[grep("Pred", colnames(myTestData))]
+myModels <- colnames(myData)[grep("Pred", colnames(myData))]
 
 myModelEval <- c()
 for (i in myModels){
   myModelEval <- rbind(myModelEval, c(i, rmse(i)))
 }
-plot(c(min_rmse, myModelEval[,2], max_rmse))
+plot(c(myModelEval[,2], max_rmse))
 
-myModelEval <- rbind(c("min_rmse", min_rmse)
-                     , myModelEval
+myModelEval <- rbind(myModelEval
                      , c("max_rmse", max_rmse))
 
 myModelEval
 
-plot(myTestData$actual, myTestData$randFPred)
-plot(myTestData$actual, myTestData$var7)
+plot(myData$target, myData$glm4Pred)
+plot(myData$target, myData$xgbPred)
+plot(myData$target, myData$randFPred)
+plot(myData$target, myData$nnPred)
+
+
+predictions <- cbind(testData$Id, exp(myData$xgb[is.na(myData$target)]))
+predictions <- as.data.frame(predictions)
+colnames(predictions) <- c("Id", "SalePrice")
+head(predictions)
+
+# write.csv(predictions, file = "johnSolerSubmission.csv", quote = F, row.names = F)
