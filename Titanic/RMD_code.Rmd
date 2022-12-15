@@ -1,0 +1,714 @@
+---
+title:  "Predicting Titanic Survivors using Logistic Regression"
+author: "John Soler"
+date:   "31 March 2019"
+output: html_document
+---
+
+> Estimated Reading Time: 15-30 minutes
+
+This project is carried out and presented here to display: my statistical knowledge particularly applied to Logistic Regression; my level of programming in R; and ability to explain and document advanced numerical techniques. I would consider this report as moderately technical and it is intended for an audience having a basic understanding of Regression as well as interest in some of the underlying concepts to this algorithm. The reader may skip all the code chunks if the programming aspect is not of interest.
+
+The problem tackled here is to predict, as accurately as possible, the fate of a set of passengers on board the Titanic; whether they would survive or not (i.e. a binary classification problem). I obtained labelled data from Kaggle in the challenge "Titanic: Machine Learning from Disaster" (https://www.kaggle.com/c/titanic), and then applied my algorithm to a test set which also provided and evaluated by Kaggle.
+
+This report gives a detailed explanation of the approach taken, including: data cleaning; feature engineering; multicollinearity and feature selection; regularisation and model evaluation. Kaggle's evaluation determined an accuracy of just over 78% for my final Logistic Regression model. Furthermore, in some sections of the report I took the opportunity to deviate slightly to explore some concepts related to Regression in general. Most of the reasoning discussed here could be applied for Churn Prediction, Insurance Pricing, Fraud Detection, Likelihodd of Adoption and most other propensity models valuable for business.
+
+
+## Contents
+
+1. Initialisation
+2. Data Cleaning
+3. Data Exploration, Feature Engineering & Scaling
+4. Multi-Collinearity & Feature Selection
+5. Model building
+6. Model Evaluation
+7. Conclusion
+
+
+##1. Initialisation
+
+The first section of the R code includes setting up packages, extracting data and making sure that the report is reproducible by setting a seed. The data is in CSV format and can be extracted directly from Kaggle, as well as from my GitHub account (as is done for this report).
+
+```{r setting_up, echo=T, message = F, chache = TRUE}
+
+set.seed(200591)
+
+packagesNeeded <- c("RCurl", "dplyr", "stringr", "ggplot2", "reshape"
+                    , "glmnet", "caret", "car", "pROC", "knitr", "kableExtra")
+
+for (i in packagesNeeded){
+  if(!(i %in% installed.packages())){
+    install.packages(i)
+  }
+  library(i, character.only = T)
+}
+
+rawTrain <- getURL("https://raw.githubusercontent.com/solerj/Kaggle_Titanic/master/train.csv")
+trainO <- read.csv(text = rawTrain)
+rawTest <- getURL("https://raw.githubusercontent.com/solerj/Kaggle_Titanic/master/test.csv")
+testO <- read.csv(text = rawTest)
+
+testO$Survived <- NA
+dataAll <- rbind(trainO, testO)
+```
+
+
+##2. Data Cleaning
+
+First, here is the raw data with some information on each variable as described in Kaggle:
+
+```{r view_data, echo=F, cache=TRUE, message = F}
+
+dataInfo <- cbind(colnames(dataAll)
+                  , c("Passenger Number"
+                      , "Survived or Not - the Target variable"
+                      , "Class of Travel"
+                      , "Name of Passenger"
+                      , "Gender"
+                      , "Age of Passengers"
+                      , "Number of Sibling/Spouse aboard"
+                      , "Number of Parent/Child aboard"
+                      , "Ticket code"
+                      , "Fare"
+                      , "Cabin code"
+                      , "The port from which a passenger has embarked. C - Cherbourg, S - Southampton, Q = Queenstown"))
+
+colnames(dataInfo) <- c("Variable", "Description")
+kable(dataInfo, format = "html", caption = "Data Description")  %>%
+  kable_styling(full_width = F)
+
+```
+
+
+Below is a summary of the structure of the table and the first few examples for each variable:
+
+```{r str, echo=F, cache=TRUE, message = F}
+
+str(dataAll)
+
+```
+
+
+A high level data cleaning is carried out. This includes preparing data types and some simple data manipulation as follows:
+
+* Extracted the title of each passenger from the `Name` variable, and called the new feature `NameTitle`
+* Filled in a few missing values for the `Fare` and `Embarked` variables
+* Transformed the variables: `Pclass`, `Sex`, `Embarked` & `NameTitle` into factors. I made sure that for each variable, the most common level is labelled as the primary level. This is important in anticipation of fitting the regression model
+* A quick analysis for any outliers was carried out and nothing noteworthy was detected
+
+```{r clean, echo=T, cache=TRUE, message = F}
+
+# Passenger Names are written as: "Surname, Title. Name"
+# I create a function to extract the Title from between the comma and fullstop
+getTitle <- function(name) {
+  firstTitle <- str_sub(name,
+                        start = (str_locate(name, ',')[1]+2),
+                        end = (str_locate(name, '[.]')[1]-1))
+  firstTitle
+}
+dataAll$Name      <- as.character(dataAll$Name)
+dataAll$NameTitle <- sapply(dataAll$Name, getTitle)
+
+
+# I replace the missing Fare values by the median Fare for similar passengers
+fareMissing <- dataAll[is.na(dataAll$Fare),]
+fareQuickFill <- median(dataAll[dataAll$NameTitle == "Mr" &
+                                  dataAll$Pclass == 3 &
+                                  dataAll$Embarked == "S"
+                                , c("Fare")], na.rm = T)
+dataAll$Fare[is.na(dataAll$Fare)] <- fareQuickFill
+
+
+# I replace the missing Embarked values by the most common embarkment for similar passengers
+embarkedMissing <- dataAll[dataAll$Embarked == "",]
+tbEmbark <- table(dataAll$Embarked[dataAll$Pclass == 1 &
+                                     dataAll$SibSp == 0 &
+                                     dataAll$Parch == 0])
+modeEmbarked <- names(which.max(tbEmbark))
+dataAll$Embarked[dataAll$Embarked == ""] <- modeEmbarked
+
+
+# I create a function to change a variable type into factor, with the levels assigned in the same order of their frequency
+myAsFactor <- function(tableName, variable){
+  if(is.factor(tableName[,c(variable)])){
+    tableName[,c(variable)] <- as.character(tableName[,c(variable)])
+  }
+  tb <- table(tableName[,c(variable)])
+  factor(tableName[,c(variable)]
+         , levels = names(tb[order(tb, decreasing = TRUE)]))
+}
+
+# Variables to be set as Factors
+dataAll$SurvivedF <- myAsFactor(dataAll, "Survived")
+variablesToRefactor <- c("Pclass", "Sex", "Embarked", "NameTitle")
+for (variable in variablesToRefactor){
+  dataAll[,c(variable)] <- myAsFactor(dataAll, variable)
+}
+
+
+# I create a function to compute the Chi-Square test of independence
+# Since the data is not always distributed on all the levels evenly (some levels for some factors contain only a few data points), I incorporate a Monte Carlo technique using the simulate.p.value parameter
+checkDependence <- function(variable1, variable2){
+  contingency <- table(dataAll[,c(variable1, variable2)])
+  chisq <- chisq.test(x = contingency, simulate.p.value = T)
+  chisq$p.value
+}
+
+```
+
+
+##3. Data Exploration
+
+In this section I investigate each variable in more detail, particularly in view of the Target variable. For each variable, I look for any relationship with the Target by using the Chi-Squared Test of Independence if the variable is categorical (e.g. Embarked) or using the Student's t-Test if the variable is numerical (e.g. Fare). When categorical variables have a lot of levels, I consider grouping levels. I also apply scaling of numerical variables as necessary.
+
+
+###Passenger Class
+
+There are three Passenger Classes: 1, 2 and 3. The majority of the passengers are in the 3rd class, as one would expect, however there is also a considerable amount of passengers in the 2nd and 3rd classes. Plotting the Survival Rate of each class shows that there each class is correlated with the passengers' survival. This observation is supported by a p-value of less than 0.05 for the Chi-Squared test for independence.
+
+```{r class, echo=FALSE, cache=TRUE, message = F, fig.height = 4, fig.width = 5, fig.align="center"}
+
+barClassSurv <- ggplot(dataAll[!is.na(dataAll$Survived),]
+                       , aes(x=Pclass
+                             , y=Survived))
+barClassSurv <- barClassSurv + stat_summary(fun.y="mean", geom="bar")
+barClassSurv <- barClassSurv + ylim(0, 1)
+barClassSurv <- barClassSurv + labs(x = "Pclass", y = "Survival Rate", title = "Survival Rate per Passenger Class")
+barClassSurv
+#testSurvPclass <- checkDependence("SurvivedF", "Pclass")
+
+```
+
+###Cabin Name
+
+The Cabin name is a string, generally starting with a letter followed by some digits. Unfortunately, `r round(sum(dataAll$Cabin == "")/nrow(dataAll),2)`% of the Cabin Names are null in the data set and there is no specified reason why these are missing. Also, there seem to be passengers associated with multiple cabins. It was decided to extract two pieces of information from this variable: The first letter of the cabin name (replaced with the letter "N" when not available) and the number of cabins associated with the passenger. For example, PassengerId 28 has the following Cabin Name: `r dataAll[dataAll$PassengerId == 28, c("Cabin")]`. For this apssenger, the new variable `cabinLetter` would take the value of "C", and the new variable `noCabins` would take the value of 3.
+
+More information could have been extracted from the cabin name such as the cabin number, and time could have been spent on attempting to fill in the missing cabin names using information from other available variables. Such considerations were noted for future iterations of the project.
+
+#####The First Cabin Letter
+
+From the chart below it was immediately clear that there was some level of dependence between the survival of passengers and the first letter of their cabin. The different cabin letters may very well have referred to different locations or different floors on board the Titanic, for example, which could explain the relationship. It is good to note that only the captain was in cabin "T", and he did not survive.
+
+```{r cabinLetter, echo=FALSE, cache=TRUE, message = F, fig.height = 4, fig.width = 7, fig.align="center"}
+
+dataAll$cabinLetter <- str_sub(dataAll$Cabin, 1, 1)
+dataAll$cabinLetter[dataAll$cabinLetter == ""] <- "N"
+barCabinSurv <- ggplot(dataAll[!is.na(dataAll$Survived),]
+                       , aes(x=reorder(cabinLetter,-Survived,mean)
+                             , y=Survived))
+barCabinSurv <- barCabinSurv + stat_summary(fun.y="mean", geom="bar")
+barCabinSurv <- barCabinSurv + ylim(0, 1)
+barCabinSurv <- barCabinSurv + labs(x = "First Cabin Letter", y = "Survival Rate", title = "Survival Rate per First Cabin Letter")
+barCabinSurv
+dataAll$cabinLetter <- myAsFactor(dataAll, "cabinLetter")
+#testSurvCabinLetter <- checkDependence("SurvivedF", "cabinLetter")
+
+```
+
+
+#####Number of Cabins
+
+Most Passengers are associated with only one cabin. This includes all the passengers for whom we do not have the cabin information. 
+
+```{r noCabins, echo=FALSE, cache=TRUE, message = F, fig.height = 4, fig.width = 5, fig.align="center"}
+
+dataAll$noCabins <- str_count(as.character(dataAll$Cabin), " ") + 1
+noCabinsDist <- dataAll %>%
+  group_by(noCabins) %>%
+  summarise(SurvivalRate = mean(Survived, na.rm = T)
+            , Frequency = n())
+kable(noCabinsDist, format = "html", caption = "Distribution of Number of Cabins")  %>%
+  kable_styling(full_width = F)
+
+testSurvNoCabins <- checkDependence("SurvivedF", "noCabins")
+
+dataAll$noCabinsGroup <- dataAll$noCabins
+dataAll$noCabinsGroup[dataAll$noCabins != 1] <- "2+"
+dataAll$noCabinsGroup <- myAsFactor(dataAll, "noCabinsGroup")
+testSurvNoCabinsGrp <- checkDependence("SurvivedF", "noCabinsGroup")
+
+```
+
+The data hints that the higher the Number of Cabins, the higher the probability of survival. However, putting this hypothesis to the test returns a p-value of `r testSurvNoCabins`. The test rejects the hypothesis probably because there is not much data for `noCabins` greater than 1. To mitigate this, the `noCabins` variable is grouped into two levels, 1 and 2+, to form a new variable called `noCabinsGroup`. Applying the Chi-Squared test now returns a p-value of `r testSurvNoCabinsGrp`, which does not quite prove the level of confidence that one would wish for, however it is decided to still include this variable in the model while keeping a close eye on it.
+
+
+###Title extracted from the Passenger Name
+
+Certainly some work needs to be done on the `NameTitle` variable because, as shown in the table below, some of the levels appear only a few times or even once in the data. Including this variable as it is in a Regression model could risk overfitting. One easy improvement is to, once again, group some of the Titles. 
+
+```{r NameTitles1, echo=FALSE, cache=TRUE, message = F, fig.height = 4, fig.width = 10, fig.align="center"}
+
+nameTitleDist <- dataAll %>%
+  group_by(NameTitle) %>%
+  summarise(SurvivalRate = mean(Survived, na.rm = T)
+            , Frequency = n())
+kable(nameTitleDist, format = "html", caption = "Distribution of Titles")  %>%
+  kable_styling(full_width = F)
+
+```
+
+Indeed, after a quick search to understand which titles suggest similar signority and gender, and keeping an eye on the Survival Rate of each Title, grouping was done as follows:
+
+* *Col*, *Don*, *Dr*, *Jonkheer*, *Major*, *Rev* and *Sir* were all grouped as *Dr*
+* *Dona*, *Dr (female)*, *Lady*, *Mlle*, *Mme* and *the Coutness* were all grouped as *Mme*
+* *Ms* and *Mrs* were grouped as *Mrs*
+
+```{r NameTitles2, echo=FALSE, cache=TRUE, message = F, fig.height = 4, fig.width = 6, fig.align="center"}
+
+# created title groups for more important people 
+dataAll$titleGroup <- as.character(dataAll$NameTitle)
+dataAll$titleGroup[dataAll$NameTitle %in% c("Col", "Don", "Dr", "Jonkheer", "Major", "Rev", "Sir")
+                   & dataAll$Sex == "male"] <- "Dr"
+dataAll$titleGroup[dataAll$NameTitle %in% c("Dona", "Dr", "Lady", "Mlle", "Mme", "the Countess")
+                   & as.character(dataAll$Sex) == "female"] <- "Mme"
+dataAll$titleGroup[dataAll$NameTitle %in% c("Ms")
+                   & as.character(dataAll$Sex) == "female"] <- "Mrs"
+dataAll$titleGroup <- myAsFactor(dataAll, "titleGroup")
+
+
+
+barTitleGrpSurv <- ggplot(dataAll[!is.na(dataAll$Survived),]
+                          , aes(x = reorder(titleGroup, -Survived, mean)
+                                , y = Survived))
+barTitleGrpSurv <- barTitleGrpSurv + stat_summary(fun.y="mean", geom="bar")
+barTitleGrpSurv <- barTitleGrpSurv + ylim(0, 1)
+barTitleGrpSurv <- barTitleGrpSurv + labs(x = "Passenger Title Group", y = "Survival Rate", title = "Survival Rate per Passenger Title Group")
+barTitleGrpSurv
+# checkDependence("SurvivedF", "titleGroup")
+
+```
+
+This results in less groups with more data points for each group. The Chi-Squared test confirms that there is some dependence between the `titleGroup` and Survival, plus with this new variable the risk of overfitting is reduced.
+
+
+###Age
+
+Upon investigating the `Age` variable, it is noticable that there is a considerable share of missing values. Before attempting to solve the issue of missing data, however, it would be wise to compare the `Age` variable against the newly created `titleGroup` variable because the `titleGroup` of the passenger may very well have a strong link with the `Age`.
+
+Here is the summary for the `Age` variable:
+
+```{r Age1, echo=FALSE, cache=TRUE, message = F}
+
+summary(dataAll$Age)
+
+```
+
+It is suspected that `Age` and `titleGroup` are correlated. The chart below shows the Survival of passengers at different ages, split by the `titleGroup` (and `gender`). Except for the `titleGroup` "Master", the `titleGroups` do not segment the passenger ages as much as one might have expected - many of the `titleGroups` have heavily operlapping passenger age brackets (i.e. not very related). Additionally, the line charts show no relationship between the Survival Rate and ages within each `titleGroup`. The line chart is plotted for different bucketing of the ages with the intention of visualising a range of plots from detailed to smoothened. None of these gives any clear indication of an existing relationship.
+
+
+```{r Age2, echo=FALSE, cache=TRUE, message = F, fig.height = 5, fig.width = 8, fig.align="center"}
+
+lineAgeTitleSurv <- ggplot(dataAll[!is.na(dataAll$Age)
+                              & !is.na(dataAll$Survived)
+                              & dataAll$titleGroup != "Capt",]
+                      , aes(x = Age
+                            , y = Survived
+                            , colour = Sex))
+lineAgeTitleSurv <- lineAgeTitleSurv + facet_grid(rows = vars(titleGroup))
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 50, fun.y="mean", geom="line", size = 0.2)
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 30, fun.y="mean", geom="line", size = 0.5)
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 20, fun.y="mean", geom="line", size = 0.75)
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 10, fun.y="mean", geom="line", size = 1)
+lineAgeTitleSurv <- lineAgeTitleSurv + labs(x = "Age", y = "Survival Rate", title = "Survival Rate across Age, split by Passenger Title Group")
+#lineAgeTitleSurv <- lineAgeTitleSurv + geom_smooth(method = "lm")
+lineAgeTitleSurv
+
+
+
+
+
+
+lineAgeTitleSurv <- ggplot(dataAll[!is.na(dataAll$Age)
+                              & !is.na(dataAll$Survived)
+                              & dataAll$titleGroup != "Capt",]
+                      , aes(x = Age
+                            , y = Survived))
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 50, fun.y="mean", geom="line", size = 0.2)
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 30, fun.y="mean", geom="line", size = 0.5)
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 20, fun.y="mean", geom="line", size = 0.75)
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 10, fun.y="mean", geom="line", size = 1)
+lineAgeTitleSurv <- lineAgeTitleSurv + labs(x = "Age", y = "Survival Rate", title = "Survival Rate across Age, split by Passenger Title Group")
+#lineAgeTitleSurv <- lineAgeTitleSurv + geom_smooth(method = "lm")
+lineAgeTitleSurv
+
+
+
+
+
+lineAgeTitleSurv <- ggplot(dataAll[!is.na(dataAll$Age)
+                              & !is.na(dataAll$Survived)
+                              & dataAll$titleGroup != "Capt",]
+                      , aes(x = Age
+                            , y = Survived
+                            , colour = Sex))
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 50, fun.y="mean", geom="line", size = 0.2)
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 30, fun.y="mean", geom="line", size = 0.5)
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 20, fun.y="mean", geom="line", size = 0.75)
+lineAgeTitleSurv <- lineAgeTitleSurv + stat_summary_bin(bins = 10, fun.y="mean", geom="line", size = 1)
+lineAgeTitleSurv <- lineAgeTitleSurv + labs(x = "Age", y = "Survival Rate", title = "Survival Rate across Age, split by Passenger Title Group")
+#lineAgeTitleSurv <- lineAgeTitleSurv + geom_smooth(method = "lm")
+lineAgeTitleSurv
+
+```
+
+Despite the lack of evidence of correlation between `Age` and the probability of survival, the `Age` variable is still bucketed into a new variable called `ageBucket` and prepared so that it could be fit in the model later on. It is expected this variable will not add any significant information to the model, and it will also be used as an example to demonstrate how modelling techniques expose this automatically. The `Age` variable was bucketed into a categorical variable to increase the chances of it being significant; bucketing relaxes the linearity assumption (such as, for example, that propability of survival decreases as the age increases, which there is no evidence of) and avoids having to implement scaling of the variable. The below bucketing was selected after trying a few quick combinations.
+
+```{r Age3, echo=FALSE, cache=TRUE, message = F, fig.height = 6, fig.width = 6, fig.align="center"}
+
+dataAll$ageBucket <- NA
+dataAll$ageBucket[dataAll$Age < 3] <- "0-3"
+dataAll$ageBucket[dataAll$Age >= 3 & dataAll$Age < 6] <- "3-6"
+dataAll$ageBucket[dataAll$Age >= 6 & dataAll$Age < 9] <- "6-9"
+dataAll$ageBucket[dataAll$Age >= 9 & dataAll$Age < 12] <- "9-12"
+dataAll$ageBucket[dataAll$Age >= 12 & dataAll$Age < 15] <- "12-15"
+dataAll$ageBucket[dataAll$Age >= 15] <- "15+"
+dataAll$ageBucket <- myAsFactor(dataAll, "ageBucket")
+
+ageBucketDist <- dataAll %>%
+  group_by(ageBucket) %>%
+  summarise(SurvivalRate = mean(Survived, na.rm = T)
+            , Frequency = n())
+
+kable(arrange(ageBucketDist, desc(Frequency)), format = "html", caption = "Distribution of Age Group")  %>%
+  kable_styling(full_width = F)
+
+# checkDependence("SurvivedF", "ageBucket")
+
+```
+
+###Embarking
+
+The majority of embarking was done at Southampton, though Cherbourg and Queenstown were common too. Plotting the Survival Rate of each shows that there could be some correlation with the port of embarkment. In fact, the survival rate for passengers embarking from Southampton is about 35%, compared to about 60% from Cherbourg. One might not find this intuitive but it could be that, for example, passengers embarking from a particular port tend to be assigned cabins on a particular floor. This possibility will be investigated further in the next section.
+
+```{r Embarking, echo=FALSE, cache=TRUE, message = F, fig.height = 4, fig.width = 4, fig.align="center"}
+
+# table(dataAll$Embarked)
+barEmbSurv <- ggplot(dataAll[!is.na(dataAll$Survived),]
+                     , aes(x = Embarked
+                           , y = Survived))
+#barEmbSurv <- barEmbSurv + facet_grid(cols = vars(cabinClass))
+barEmbSurv <- barEmbSurv + stat_summary(fun.y="mean", geom="bar")
+barEmbSurv <- barEmbSurv + ylim(0, 1)
+barEmbSurv <- barEmbSurv + labs(x = "Port Embarked", y = "Survival Rate", title = "Survival Rate per Port Embarked")
+barEmbSurv
+# checkDependence("SurvivedF", "Embarked")
+
+```
+
+###Fare
+
+The `Fare` variable is the one with the widest range and biggest variance (note how the 3rd quartile is much smaller than the maximum), plus it is also heavily skewed (note the difference between the median and the mean). Plotting its distribution reveals an exponential shape, which comes to no surprise.
+
+```{r Fare0, echo=FALSE, cache=TRUE, message = F, fig.height = 5, fig.width = 5, fig.align="center"}
+
+summary(dataAll$Fare)
+
+```
+
+It is important that the variable is transformed to be more symmetric, with moderate variance and with a range between 0 and 1.
+
+Applying the natural log to the variable gives a much more normal-like distribution, which is expected to perform better with logistic regression. This also gives us the symmetry that we are looking for. Note that some passengers have a fare amount of $0, which is catered for by adding 1 before applying the log transformation. This transformed variable is saved as `logFare`.
+
+The line chart of Survival Rate versus (binned) logFare gives strong evidence for a linear relationship between the two variables, which means that `logFare` is a promising variable for the logistic regression model. Next, `logFare` needs to be scaled ideally between 0 and 1.
+
+
+```{r Fare1, echo=FALSE, cache=TRUE, message = F, fig.height = 5, fig.width = 5, fig.align="center"}
+
+dataAll$logFare <- log(dataAll$Fare + 1)
+
+
+histFare <- ggplot(dataAll[!is.na(dataAll$Survived),]
+                       , aes(x = logFare))
+histFare <- histFare + geom_histogram(binwidth = 0.5)
+histFare <- histFare + labs(x = "logFare", y = "Survival Rate", title = "Relationship of Survival Rate with logFare")
+histFare
+
+scatFareSurv <- ggplot(dataAll[!is.na(dataAll$Survived),]
+                       , aes(x = logFare
+                             , y = Survived))
+scatFareSurv <- scatFareSurv + stat_summary_bin(bins = 50, fun.y="mean", geom="line", size = 0.2)
+scatFareSurv <- scatFareSurv + stat_summary_bin(bins = 30, fun.y="mean", geom="line", size = 0.5)
+scatFareSurv <- scatFareSurv + stat_summary_bin(bins = 20, fun.y="mean", geom="line", size = 0.75)
+scatFareSurv <- scatFareSurv + stat_summary_bin(bins = 10, fun.y="mean", geom="line", size = 1)
+scatFareSurv <- scatFareSurv + geom_smooth(method = "lm")
+scatFareSurv <- scatFareSurv + labs(x = "logFare", y = "Survival Rate", title = "Relationship of Survival Rate with logFare")
+scatFareSurv
+
+
+medlogFare <- median(dataAll$logFare)
+dataAll$logFareS <- dataAll$logFare / (2*medlogFare)
+
+```
+
+As a scaling factor, the `logFare` is then is then divided by the median of `logFare`, and saved as `logFareS`. This reduces the range of the variable to be between `r min(dataAll$logFareS)` and `r max(dataAll$logFareS)`, which is good enough. From the variable summary below it is also good to confirm that the distribution of the transformed variable is indeed symmetric and with moderate variance.
+
+```{r Fare2, echo=FALSE, cache=TRUE, message = F, fig.height = 5, fig.width = 5, fig.align="center"}
+
+summary(dataAll$logFareS)
+
+```
+
+If we were, for some reason, to hypothesise that the relationship between `Fare` and Survival is different across `Sex` (such as we have seen for `Age`), one may plot a chart such as the below to get some insight. The chart shows two (practically) parallel lines at different y-intercepts. This means that the rate of change of Survival across the `logFare` is the same for each gender, so there is most probably no need to any interaction terms between the two. The difference between the y-intercepts will be taken care of by the `Sex` feature in the model.
+
+
+```{r Fare3, echo=FALSE, cache=TRUE, message = F, fig.height = 5, fig.width = 7, fig.align="center"}
+scatSexFareSurv <- ggplot(dataAll[!is.na(dataAll$Survived),]
+                       , aes(x = logFare
+                             , y = Survived
+                             , col = Sex))
+scatSexFareSurv <- scatSexFareSurv + stat_summary_bin(bins = 50, fun.y="mean", geom="line", size = 0.2)
+scatSexFareSurv <- scatSexFareSurv + stat_summary_bin(bins = 30, fun.y="mean", geom="line", size = 0.5)
+scatSexFareSurv <- scatSexFareSurv + stat_summary_bin(bins = 20, fun.y="mean", geom="line", size = 0.75)
+scatSexFareSurv <- scatSexFareSurv + stat_summary_bin(bins = 10, fun.y="mean", geom="line", size = 1)
+scatSexFareSurv <- scatSexFareSurv + geom_smooth(method = "lm")
+scatSexFareSurv <- scatSexFareSurv + labs(x = "logFare", y = "Survival Rate", title = "Relationship of Survival Rate with logFare")
+scatSexFareSurv
+```
+
+###Number of Parents or Children related to the Passenger onboard
+
+The table below shows that some levels of `Parch` have low frequency and that some levels have similar survival rates; this immediately suggests that there is room for grouping some of the levels.
+
+```{r Parch, echo=FALSE, cache=TRUE, message = F, fig.height = 4, fig.width = 4, fig.align="center"}
+
+parchDist <- dataAll %>%
+  group_by(Parch) %>%
+  summarise(SurvivalRate = mean(Survived, na.rm = T)
+            , Frequency = n())
+
+kable(arrange(parchDist, desc(Frequency)), format = "html", caption = "Distribution of Number of Parents/Children")  %>%
+  kable_styling(full_width = F)
+
+dataAll$parchGroup <- dataAll$Parch
+dataAll$parchGroup[dataAll$Parch %in% c(1,3)] <- "1_3"
+dataAll$parchGroup[dataAll$Parch >= 4] <- "4+"
+dataAll$parchGroup <- myAsFactor(dataAll, "parchGroup")
+# table(dataAll$parchGroup)
+# chisqSurvParchgrp <- checkDependence("SurvivedF", "parchGroup")
+
+```
+
+By inspection it was decided to keep level *0* on its own, group levels *1 to 3* and group levels *4+*. This results in 3 groups that are confirmed to be related to the survival rate using the Chi-Squared test once again, using the Monte-Carlo simulation since the 4+ group has an expected frequency of less than 5.
+
+
+###Number of Siblings or Spouse related to the Passenger onboard
+
+Finally, very similar to the transformation to the `Parch` variable, the `SibSp` is grouped into 4 groups: *0*, *1-2*, *3-4* and *5+*.
+
+```{r SibSp, echo=FALSE, cache=TRUE, message = F, fig.height = 4, fig.width = 6, fig.align="center"}
+
+sibSpDist <- dataAll %>%
+  group_by(SibSp) %>%
+  summarise(SurvivalRate = mean(Survived, na.rm = T)
+            , Frequency = n())
+
+kable(arrange(sibSpDist, desc(Frequency)), format = "html", caption = "Distribution of Number of Siblings/Spouse")  %>%
+  kable_styling(full_width = F)
+
+
+dataAll$sibspGroup <- dataAll$SibSp
+dataAll$sibspGroup[dataAll$SibSp %in% c(1,2)] <- "1_2"
+dataAll$sibspGroup[dataAll$SibSp %in% c(3,4)] <- "3_4"
+dataAll$sibspGroup[dataAll$SibSp >= 5] <- "5+"
+dataAll$sibspGroup <- myAsFactor(dataAll, "sibspGroup")
+
+
+# table(dataAll$sibspGroup)
+# checkDependence("SurvivedF", "sibspGroup")
+
+```
+
+##4. Multi-Collinearity & Feature Selection
+
+At this point, a Data Scientist may very well throw all the features into a Logistic Regression Model and use k-fold validation to add/remove features. For this report, I adopt a more controlled and deliberate (possibly less accurate) approach, which is likely to be more beneficial in a business setting since it gives more insight into the feature interactions and relevance to the final prediction. Here is the list of eligible features for the model:
+
+`Pclass`, `Sex`, `cabinLetter`, `noCabinsGroup`, `titleGroup`, `ageBucket`, `Embarked`, `logFareS`, `parchGroup`, `sibspGroup`
+
+
+MENTION ISSUE IF INCLUDE SEX - there is the titleGroup variable which is perfectly ?correlated?
+
+```{r featureSelect0, echo=FALSE, cache=TRUE, message = F}
+dataTrain    <- dataAll[!is.na(dataAll$Survived),]
+dataAge      <- dataAll[!is.na(dataAll$Age),]
+dataTrainAge <- dataAll[!is.na(dataAll$Survived) & !is.na(dataAll$Age),]
+
+myFitVIF <- function(myDf, modelFeatures){
+  myFit <- glm(SurvivedF ~ .
+                  , data = myDf[, c("SurvivedF", modelFeatures)]
+                  , family = binomial)
+  myFitSummary <- summary(myFit)
+  varInfFact <- as.data.frame(vif(myFit))
+  varInfFact <- varInfFact[order(-varInfFact$GVIF),]
+  output <- list(myFitSummary, varInfFact)
+}
+
+variables0 <- c("Pclass", "cabinLetter", "noCabinsGroup", "titleGroup"
+                , "ageBucket", "Embarked", "logFareS", "parchGroup"
+                , "sibspGroup")
+allFit <- myFitVIF(dataTrainAge, variables0)
+allFit
+```
+
+
+```{r featureSelect, echo=FALSE, cache=TRUE, message = F}
+
+
+# APPLY PCA HERE???
+
+
+# Pclass vs cabinLetter -------------------------
+table(dataAll[,c("Pclass", "cabinLetter")])
+checkDependence("Pclass", "cabinLetter")
+
+barCabinNullSurv <- ggplot(dataAll[!is.na(dataAll$Survived)
+                                   & dataAll$cabinLetter == "N",]
+                       , aes(x = Pclass
+                             , y = Survived))
+barCabinNullSurv <- barCabinNullSurv + stat_summary(fun.y="mean", geom="bar")
+barCabinNullSurv <- barCabinNullSurv + ylim(0, 1)
+barCabinNullSurv
+
+dataAll$cabinClass <- as.character(dataAll$cabinLetter)
+dataAll$cabinClass[dataAll$cabinLetter == "N"] <- as.character(dataAll$Pclass[dataAll$cabinLetter == "N"])
+dataAll$cabinClass <- myAsFactor(dataAll, "cabinClass")
+table(dataAll$cabinClass)
+
+barCabinClassSurv <- ggplot(dataAll[!is.na(dataAll$Survived),]
+                       , aes(x=reorder(cabinClass, -Survived, mean)
+                             , y = Survived))
+barCabinClassSurv <- barCabinClassSurv + stat_summary(fun.y="mean", geom="bar")
+barCabinClassSurv <- barCabinClassSurv + ylim(0, 1)
+barCabinClassSurv
+
+
+variables1 <- c("cabinClass", "noCabinsGroup", "titleGroup"
+                , "ageBucket", "Embarked", "logFareS", "parchGroup"
+                , "sibspGroup")
+dataTrain    <- dataAll[!is.na(dataAll$Survived),]
+dataAge      <- dataAll[!is.na(dataAll$Age),]
+dataTrainAge <- dataAll[!is.na(dataAll$Survived) & !is.na(dataAll$Age),]
+allFit1 <- myFitVIF(dataTrainAge, variables1)
+allFit1
+# AIC actually improved
+# some VIF still high
+
+
+# ageBucket vs titleGroup -----------------------
+table(dataAge[, c("titleGroup", "ageBucket")])
+table(dataTrainAge[, c("titleGroup", "ageBucket")])
+
+variables2 <- c("cabinClass", "noCabinsGroup", "titleGroup"
+                , "Embarked", "logFareS", "parchGroup"
+                , "sibspGroup")
+allFit2 <- myFitVIF(dataTrainAge, variables2)
+allFit2
+# remove Age from Model. now switch to full data set
+# because missing age is no longer issue
+
+
+# full data (no age missing) --------------------
+allFit2_ <- myFitVIF(dataTrain, variables2)
+allFit2_
+# remove Age from Model. now switch to full data set
+# because missing age is no longer issue
+
+
+# removing cabinClass since high VIF ------------
+variables3 <- variables2[!(variables2 %in% "cabinClass")]
+allFit3 <- myFitVIF(dataTrain, variables3)
+allFit3
+# suddenly logFareS is very significant in model.
+# Try removing that and re-introduce cabinClass
+
+
+# removing logFareS -----------------------------
+variables4 <- variables2[!(variables2 %in% "logFareS")]
+allFit4 <- myFitVIF(dataTrain, variables4)
+allFit4
+# remove Age from Model. now switch to full data set
+# because missing age is no longer issue
+
+
+# adding interaction term logFareS:cabinClass ---
+myFitInteraction1 <- glm(SurvivedF ~ . + cabinClass:logFareS - cabinClass - logFareS
+                         , data = dataTrain[, c("SurvivedF", variables2)]
+                         , family = binomial)
+myFitInteraction1Summary <- summary(myFitInteraction1)
+varInfFact1 <- as.data.frame(vif(myFitInteraction1))
+varInfFact1 <- varInfFact1[order(-varInfFact1$GVIF),]
+output1 <- list(myFitInteraction1Summary, varInfFact1)
+output1
+
+
+# removing Embarked -----------------------------
+variables5 <- variables2[!(variables2 %in% "Embarked")]
+myFitInteraction2 <- glm(SurvivedF ~ . + cabinClass:logFareS - cabinClass - logFareS
+             , data = dataTrain[, c("SurvivedF", variables5)]
+             , family = binomial)
+myFitInteraction2Summary <- summary(myFitInteraction2)
+varInfFact2 <- as.data.frame(vif(myFitInteraction2))
+varInfFact2 <- varInfFact2[order(-varInfFact2$GVIF),]
+output2 <- list(myFitInteraction2Summary, varInfFact2)
+output2
+
+```
+
+
+Of these, an initial selection of features was made. At this point, the excluded features were ones which are obviously correlated to another feature, or ones which were considered as not robust enough.
+
+Next, it was made sure that all features were scaled to the range [0,1]. Most of the features were already percentages in the desired range, so those were untouched. For the ones that had larger ranges, a sigmoid function was applied.
+
+Let $x$ be the original column and let $y$ be the normalised column. Then the normalising equation is in the form:
+
+$y = ({1}/({1+x}))^p$
+
+where $p$ is selected such that the median of the particular column is normalised to $0.5$.
+
+```{r feature_scaling_and_initial_selection, echo=FALSE, cache=TRUE, message = F}
+
+
+```
+
+
+##5. Inferring the customer gender - Refined model: Defining Criteria
+
+It is important to note that the inferred gender from the Refined Model differs from those of the Baseline Model by only bla bla. This is good news because the Baseline Model should already have been a good start, so a redical change by the Refined Model would have raised questions. The fact that the male/female split has not changed much either is also a positive sign. These figures could suggest that the Refined Model is indeed a "refinement".
+
+
+
+
+```{r model_selection, echo=FALSE, cache=TRUE, message = F}
+
+
+
+```
+
+Taking into consideration the results above and the efficiency of the algorithm, it was deemed that the best performing model was the Neural Network, even though each algorithm was highly accurate. Below is the summary of the Neural Network Model performance.
+
+
+```{r best_model, echo=FALSE, cache=TRUE, message = F}
+
+
+
+```
+
+
+##10. Summary
+
+
+test 1 2 3
+
+
+#### Recommendation for additional features
+
+
+1. test1
+2. test2
+
+
+#### Suggested improvements for model performance
+
+Here are just a few ideas on how the results could be improved further:
+
+* Further investigation is needed on the data cleaning part, to have complete reconciliations
+* Consulting industry experts to improve criterias for the _Core Labelled Subset_
